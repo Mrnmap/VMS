@@ -1,0 +1,842 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Nessus VM Dashboard — with Ports & Nmap</title>
+  <!-- Tailwind (styling) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React + ReactDOM (UMD) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <!-- Babel for JSX in-browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- PapaParse for CSV -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <!-- SheetJS for Excel export -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <!-- Chart.js for charts -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    html, body { background: #f8fafc; }
+    .card { background: #fff; border-radius: 1rem; box-shadow: 0 6px 16px rgba(2,6,23,0.06); }
+    .pill { display:inline-block;padding:.125rem .5rem;border-radius:.5rem;color:#fff;font-weight:600;font-size:.8rem; }
+    .monosmall { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: .8rem; }
+    .table-scroller { overflow:auto; max-height: 18rem; }
+    .chart-wrap { height: 18rem; }
+    .chart-wrap-tall { height: 22rem; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+<script type="text/babel">
+const {useMemo, useState, useEffect, useRef} = React;
+
+const SEV_COLORS = { Critical:'#800080', High:'#FF0000', Medium:'#FFA500', Low:'#00AA00', Info:'#87CEEB' };
+const sevOrderVal = s => ({Critical:1, High:2, Medium:3, Low:4, Info:5}[s] ?? 99);
+const uniq = arr => Array.from(new Set(arr.filter(Boolean)));
+const splitHosts = s => uniq(String(s||'').split(',').map(x=>x.trim()).filter(Boolean));
+const todayStr = () => new Date().toISOString().slice(0,10);
+
+// localStorage client persistence
+const LS_PREFIX = 'vm_client_';
+const listClients = () => Object.keys(localStorage).filter(k=>k.startsWith(LS_PREFIX)).map(k=>k.replace(LS_PREFIX,''));
+const saveClientSnapshot = (snap) => localStorage.setItem(LS_PREFIX + snap.client, JSON.stringify(snap));
+const loadClientSnapshot = (name) => {
+  const raw = localStorage.getItem(LS_PREFIX + name);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+};
+
+// ---- normalization
+function pickFirst(...vals){
+  for (const v of vals){
+    const s = (v ?? '').toString().trim();
+    if (s) return s;
+  }
+  return '';
+}
+
+function normalizeRows(rows) {
+  return rows.map(r=>{
+    let risk = pickFirst(r['Risk Factor'], r['Risk'], r['Severity']).toString();
+    if (!risk || risk.toLowerCase()==='none') risk = 'Info';
+
+    // infer Port/Protocol from description/plugin output if missing
+    let Port = pickFirst(r.Port);
+    let Protocol = pickFirst(r.Protocol);
+    let Service = pickFirst(r.Service);
+    const desc = pickFirst(r.Description, r['Plugin Output'], r['Synopsis']);
+    const portHint = desc.match(/(?:^|\b)port\s*:\s*(\d+)\s*\/\s*(tcp|udp)\b/i) || desc.match(/\b(\d{1,5})\/(tcp|udp)\b/);
+    if ((!Port || !Protocol) && portHint){
+      Port = Port || portHint[1];
+      Protocol = Protocol || portHint[2].toLowerCase();
+    }
+
+    // synopsis / recommendation mapping
+    const Synopsis = pickFirst(r.Synopsis, r['Synopsis ']); // sometimes a trailing space
+    const Recommendation = pickFirst(r.Recommendation, r['Recommended Fix'], r['Remediation'],
+                                     r.Solution, r['Solution Text'], r['Fix']);
+
+    return {
+      ...r,
+      'Risk Factor': risk,
+      Host: pickFirst(r.Host, r['Host(s)']),
+      Name: pickFirst(r.Name, r['Plugin Name']),
+      Port, Protocol, Service,
+      Synopsis,
+      Recommendation
+    };
+  });
+}
+
+// ---- trackers
+function buildTrackers(rows) {
+  const main = new Map();
+  const info = new Map();
+  for (const r of rows) {
+    const sev = r['Risk Factor']||'Info';
+    const key = sev+'__'+(r.Name||'Unnamed');
+    const tgt = sev==='Info'? info: main;
+    if (!tgt.has(key)) tgt.set(key, { severity: sev, name: r.Name||'Unnamed', hosts: [], status: 'Open', owner:'', targetDate:'', synopsis: r.Synopsis||'', recommendation: r.Recommendation||'' });
+    const item = tgt.get(key);
+    item.hosts = uniq([...item.hosts, ...splitHosts(r.Host||'')]);
+    // Prefer non-empty synopsis/reco if current is empty
+    if (!item.synopsis && r.Synopsis) item.synopsis = r.Synopsis;
+    if (!item.recommendation && r.Recommendation) item.recommendation = r.Recommendation;
+  }
+  const sort = m => Array.from(m.values()).sort((a,b)=> sevOrderVal(a.severity)-sevOrderVal(b.severity) || a.name.localeCompare(b.name));
+  return { main: sort(main), info: sort(info) };
+}
+
+// ---- All Findings with sorting (default: severity Critical→Low, then Name)
+function computeAllFindings(rows, sortBy='severity', sortDir='asc') {
+  const filtered = rows.filter(r => ['Critical','High','Medium','Low'].includes(r['Risk Factor']||''));
+  const sevRank = s => ({Critical:1, High:2, Medium:3, Low:4}[s] ?? 99);
+  const getFirstHost = (h) => (String(h||'').split(',')[0]||'').trim();
+  const toNum = (x) => {
+    const n = Number(String(x||'').match(/^\d+$/)?.[0] ?? NaN);
+    return Number.isFinite(n) ? n : 9_999_999;
+  };
+  const cmp = (a, b) => {
+    let val = 0;
+    if (sortBy === 'severity') {
+      val = sevRank(a['Risk Factor']) - sevRank(b['Risk Factor']);
+      if (val===0) val = String(a.Name||'').localeCompare(String(b.Name||''));
+    } else if (sortBy === 'name') {
+      val = String(a.Name||a['Plugin Name']||'').localeCompare(String(b.Name||b['Plugin Name']||''));
+    } else if (sortBy === 'host') {
+      val = getFirstHost(a.Host).localeCompare(getFirstHost(b.Host));
+    } else if (sortBy === 'port') {
+      val = toNum(a.Port) - toNum(b.Port);
+    } else if (sortBy === 'service') {
+      val = String(a.Service||'').localeCompare(String(b.Service||''));
+    }
+    return sortDir === 'desc' ? -val : val;
+  };
+  return filtered.sort(cmp);
+}
+
+function computeSeverityCounts(main, info) {
+  const c = {Critical:0, High:0, Medium:0, Low:0, Info:0};
+  main.forEach(t=> { if (t.status==='Open') c[t.severity]++; });
+  info.forEach(t=> { if (t.status==='Open') c.Info++; });
+  return c;
+}
+
+function computeTop10(main) {
+  const rows=[];
+  main.forEach(t=>{
+    if (t.status!=='Open') return;
+    t.hosts.forEach(h=> rows.push({name:t.name, severity:t.severity, host:h}));
+  });
+  const map = new Map();
+  rows.forEach(r=>{
+    const k = r.name+'__'+r.severity;
+    if (!map.has(k)) map.set(k, new Set());
+    map.get(k).add(r.host);
+  });
+  const table = Array.from(map.entries()).map(([k,set])=>{
+    const [Vulnerability, Severity] = k.split('__');
+    return { Vulnerability, Severity, UniqueHosts: set.size };
+  });
+  return table.sort((a,b)=> b.UniqueHosts-a.UniqueHosts || sevOrderVal(a.Severity)-sevOrderVal(b.Severity) || a.Vulnerability.localeCompare(b.Vulnerability)).slice(0,10);
+}
+
+function computeHostBreakdown(main) {
+  const m = new Map();
+  main.forEach(t=>{
+    if (t.status!=='Open') return;
+    t.hosts.forEach(h=> m.set(h, (m.get(h)||0) + 1));
+  });
+  return Array.from(m.entries()).map(([Host, OpenFindings])=>({Host, OpenFindings}))
+    .sort((a,b)=> b.OpenFindings-a.OpenFindings || a.Host.localeCompare(b.Host))
+    .slice(0,20);
+}
+
+// --- Ports & Services (Nessus) - only from CHML rows & Open in Tracker
+function computePortServiceGroupsNessus(allRows, trackerMain){
+  const openKey = new Set();
+  trackerMain.forEach(t=>{ if(t.status==='Open') openKey.add(t.severity+'__'+t.name); });
+  const groups = new Map();
+  allRows.forEach(r=>{
+    const sev = (r['Risk Factor']||'')+'';
+    if (!['Critical','High','Medium','Low'].includes(sev)) return; // ignore Info
+    const keyName = sev+'__'+(r.Name||'');
+    if (!openKey.has(keyName)) return;
+    const port=(r.Port||'')+''; const protocol=(r.Protocol||'')+''; const service=(r.Service||'')+''; 
+    const k = port+'||'+service+'||'+protocol;
+    if (!groups.has(k)) groups.set(k, {port, service, protocol, count:0, hosts:new Set()});
+    const g = groups.get(k); g.count++; splitHosts(r.Host||'').forEach(h=> g.hosts.add(h));
+  });
+  return Array.from(groups.values()).map(g=>({ port:g.port, service:g.service, protocol:g.protocol, count:g.count, hosts:Array.from(g.hosts).sort() }))
+    .sort((a,b)=> b.count-a.count || (a.port||'').localeCompare(b.port||''));
+}
+
+// --- Nmap TXT parsing
+function parseNmapTxt(text){
+  const rows = [];
+  let curHost = '';
+  const lines = String(text||'').split(/[\r\n]+/);
+  const reReport = /^Nmap scan report for (.+?)(?: \((\d{1,3}(?:\.\d{1,3}){3})\))?$/i;
+  const rePort = /^(\d{1,5})\/(tcp|udp)\s+open\s+([a-z0-9_\-\+\.\?]+)(?:\s+.*)?$/i;
+  const reGreppable = /^Host:\s*(\S+).*?Ports:\s*(.+)$/i;
+
+  for (const line of lines){
+    const g = line.match(reGreppable);
+    if (g){
+      curHost = g[1];
+      const ports = g[2].split(/\s*,\s*/);
+      ports.forEach(p=>{
+        const parts = p.split('/'); // port/state/proto//service///
+        const port = parts[0]||''; const state = parts[1]||''; const proto = parts[2]||''; const service = parts[4]||'';
+        if (state.toLowerCase()==='open'){
+          rows.push({ Host: curHost, Port: port, Protocol: proto, Service: service });
+        }
+      });
+      continue;
+    }
+    const m = line.match(reReport);
+    if (m){
+      curHost = (m[2] || m[1] || '').trim(); // prefer IP if present
+      continue;
+    }
+    const p = line.match(rePort);
+    if (p && curHost){
+      rows.push({ Host: curHost, Port: p[1], Protocol: p[2].toLowerCase(), Service: p[3].toLowerCase() });
+      continue;
+    }
+  }
+  return rows;
+}
+
+// group Nmap rows by (port,service,protocol)
+function computeNmapGroups(nmapRows){
+  const groups = new Map();
+  nmapRows.forEach(r=>{
+    const port=(r.Port||'')+''; const service=(r.Service||'')+''; const protocol=(r.Protocol||'')+'';
+    const k = port+'||'+service+'||'+protocol;
+    if (!groups.has(k)) groups.set(k, {port, service, protocol, hosts:new Set(), count:0});
+    const g = groups.get(k); g.count++; g.hosts.add(r.Host);
+  });
+  return Array.from(groups.values()).map(g=>({ port:g.port, service:g.service, protocol:g.protocol, count:g.count, hosts:Array.from(g.hosts).sort() }))
+    .sort((a,b)=> (b.hosts.length - a.hosts.length) || b.count - a.count || (a.port||'').localeCompare(b.port||''));
+}
+
+function uniqueIPsPerPort(rows){ // rows: [{Host, Port, ...}]
+  const m = new Map(); // port -> set(hosts)
+  rows.forEach(r=>{
+    const port = (r.Port||'')+''; const host=(r.Host||'')+'';
+    if (!m.has(port)) m.set(port, new Set());
+    m.get(port).add(host);
+  });
+  return Array.from(m.entries()).map(([Port,set])=>({Port, UniqueHosts:set.size})).sort((a,b)=> b.UniqueHosts-a.UniqueHosts || (''+a.Port).localeCompare(''+b.Port));
+}
+
+// --- Host counting helpers
+function uniqHostsFromListBySeverity(list, sev){
+  const set = new Set();
+  list.forEach(t => {
+    if (t.status==='Open' && t.severity===sev) {
+      (t.hosts||[]).forEach(h => set.add(h));
+    }
+  });
+  return set;
+}
+
+// Chart.js reusable component
+function ChartBox({type='bar', data, options, className='chart-wrap'}) {
+  const ref = useRef(null);
+  const chartRef = useRef(null);
+  useEffect(()=>{
+    if (!ref.current) return;
+    if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
+    const ctx = ref.current.getContext('2d');
+    chartRef.current = new Chart(ctx, { type, data, options });
+    return ()=> { if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; } };
+  }, [JSON.stringify(data), JSON.stringify(options), type]);
+  return <div className={className}><canvas ref={ref}/></div>;
+}
+
+function App(){
+  const [client, setClient] = useState('');
+  const [clients, setClients] = useState([]);
+  const [project, setProject] = useState('');
+  const [scanDate, setScanDate] = useState('');
+  const [raw, setRaw] = useState([]);           // Nessus rows (normalized)
+  const [nmapRows, setNmapRows] = useState([]); // Nmap rows (parsed)
+  const [trackerMain, setTrackerMain] = useState([]);
+  const [trackerInfo, setTrackerInfo] = useState([]);
+  const [tab, setTab] = useState('dashboard');
+
+  // Sorting for All Findings: default severity asc (Critical first)
+  const [allSortBy, setAllSortBy] = useState('severity'); // severity | name | host | port | service
+  const [allSortDir, setAllSortDir] = useState('asc');    // asc | desc
+
+  useEffect(()=>{ setClients(listClients()); },[]);
+
+  function loadForClient(name){
+    if (!name) return;
+    const snap = loadClientSnapshot(name);
+    if (!snap) { alert('No saved snapshot for: ' + name); return; }
+    setClient(snap.client || name);
+    setProject(snap.project || '');
+    setScanDate(snap.scanDate || '');
+    setTrackerMain(snap.trackerMain || []);
+    setTrackerInfo(snap.trackerInfo || []);
+    // raw stays empty unless CSV is re-uploaded; All Findings will compute from raw when provided
+    setTab('dashboard');
+  }
+
+  const counts = useMemo(()=> computeSeverityCounts(trackerMain, trackerInfo), [trackerMain, trackerInfo]);
+  const top10 = useMemo(()=> computeTop10(trackerMain), [trackerMain]);
+  const hostBreakdown = useMemo(()=> computeHostBreakdown(trackerMain), [trackerMain]);
+
+  // Unique host counts (Open only)
+  const openHostCountsBySev = useMemo(()=>{
+    const obj = {Critical:0, High:0, Medium:0, Low:0};
+    ['Critical','High','Medium','Low'].forEach(sev=>{
+      obj[sev] = uniqHostsFromListBySeverity(trackerMain, sev).size;
+    });
+    return obj;
+  }, [trackerMain]);
+  const totalUniqueOpenHosts = useMemo(()=> Object.values(openHostCountsBySev).reduce((a,b)=>a+b,0), [openHostCountsBySev]);
+
+  // Ports (Nessus CHML + Open only)
+  const psNessus = useMemo(()=> computePortServiceGroupsNessus(raw, trackerMain), [raw, trackerMain]);
+  const topPortsNessus = useMemo(()=>{
+    const m=new Map(); psNessus.forEach(g=> m.set(g.port||'(none)', (m.get(g.port||'(none)')||0)+g.count));
+    return Array.from(m.entries()).map(([Port,OpenFindings])=>({Port,OpenFindings})).sort((a,b)=> b.OpenFindings-a.OpenFindings).slice(0,20);
+  }, [psNessus]);
+
+  // Ports (Nmap)
+  const psNmap = useMemo(()=> computeNmapGroups(nmapRows), [nmapRows]);
+  const topPortsNmap = useMemo(()=> psNmap.map(g=> ({Port:g.port||'(none)', UniqueHosts:g.hosts.length})).sort((a,b)=> b.UniqueHosts-a.UniqueHosts).slice(0,20), [psNmap]);
+  const nmapUniqueHostCount = useMemo(()=> (new Set(nmapRows.map(r=> r.Host))).size, [nmapRows]);
+
+  function handleCSV(file){
+    Papa.parse(file, { header:true, skipEmptyLines:true, complete: (res) => {
+      const rows = normalizeRows(res.data);
+      setRaw(rows);
+      const {main, info} = buildTrackers(rows);
+      setTrackerMain(main);
+      setTrackerInfo(info);
+      setTab('dashboard');
+    }});
+  }
+
+  function handleNmap(file){
+    const reader = new FileReader();
+    reader.onload = () => {
+      try{
+        const rows = parseNmapTxt(String(reader.result||''));
+        setNmapRows(rows);
+        setTab('ports'); // jump to Ports tab
+      }catch(e){ alert('Nmap parse error: ' + (e && e.message || e)); }
+    };
+    reader.readAsText(file);
+  }
+
+  const updateTracker = (list, idx, patch) => {
+    if (list==='main') setTrackerMain(prev => prev.map((r,i)=> i===idx? {...r, ...patch}: r));
+    else setTrackerInfo(prev => prev.map((r,i)=> i===idx? {...r, ...patch}: r));
+  };
+
+  // Always derive "All Findings" from raw + sort settings (prevents stale order)
+  const allFindingsSorted = useMemo(()=>{
+    if (!raw.length) return [];
+    return computeAllFindings(raw, allSortBy, allSortDir);
+  }, [raw, allSortBy, allSortDir]);
+
+  function downloadExcel(){
+    const dash = [
+      ['Project', project],
+      ['Client', client],
+      ['Scan Date', scanDate||todayStr()],
+      [],
+      ['Risk Factor','Open Count'],
+      ['Critical',counts.Critical||0],
+      ['High',counts.High||0],
+      ['Medium',counts.Medium||0],
+      ['Low',counts.Low||0],
+      [],
+      ['Unique Hosts (Open)','Count'],
+      ['Total', totalUniqueOpenHosts],
+      ['Critical', openHostCountsBySev.Critical||0],
+      ['High', openHostCountsBySev.High||0],
+      ['Medium', openHostCountsBySev.Medium||0],
+      ['Low', openHostCountsBySev.Low||0],
+    ];
+
+    const tHead = ['Risk Factor','Name','Synopsis','Recommendation','Hosts','Status','Owner','Target Date','Aging (days)','Client'];
+    const trackerRows = [tHead, ...trackerMain.map(t => [
+      t.severity, t.name, t.synopsis||'', t.recommendation||'',
+      (t.hosts||[]).join(', '), t.status, t.owner||'', t.targetDate||'', '', client
+    ])];
+    const infoRows = [tHead, ...trackerInfo.map(t => [
+      t.severity, t.name, t.synopsis||'', t.recommendation||'',
+      (t.hosts||[]).join(', '), t.status, t.owner||'', t.targetDate||'', '', client
+    ])];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(dash), 'Dashboard');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(trackerRows), 'Tracker');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(infoRows), 'Info Vulns');
+
+    if (allFindingsSorted.length){
+      const headers = Object.keys(allFindingsSorted[0]);
+      const allRows = [headers, ...allFindingsSorted.map(r=> headers.map(h=> r[h]??''))];
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(allRows), 'All Findings');
+    }
+
+    // Ports sheets
+    const ps1 = [['Port','Service','Protocol','Open Findings','Unique Hosts','Hosts'], ...psNessus.map(g=> [g.port||'', g.service||'', g.protocol||'', g.count||0, (g.hosts?g.hosts.length:0), (g.hosts||[]).join(', ')])];
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(ps1), 'Ports & Services (Nessus)');
+    const ps2 = [['Port','Service','Protocol','Rows','Unique Hosts','Hosts'], ...psNmap.map(g=> [g.port||'', g.service||'', g.protocol||'', g.count||0, (g.hosts?g.hosts.length:0), (g.hosts||[]).join(', ')])];
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(ps2), 'Nmap Ports');
+
+    // Metrics sheet
+    const chartsSheet = [
+      ['Metric','Value'],
+      ['Open Findings - Critical', counts.Critical||0],
+      ['Open Findings - High', counts.High||0],
+      ['Open Findings - Medium', counts.Medium||0],
+      ['Open Findings - Low', counts.Low||0],
+      [],
+      ['Unique Hosts (Open)','Count'],
+      ['Total', totalUniqueOpenHosts],
+      ['Critical', openHostCountsBySev.Critical||0],
+      ['High', openHostCountsBySev.High||0],
+      ['Medium', openHostCountsBySev.Medium||0],
+      ['Low', openHostCountsBySev.Low||0],
+      [],
+      ['Top 5 Ports (Nessus)','Open Findings'],
+      ...topPortsNessus.slice(0,5).map(r=> [r.Port, r.OpenFindings]),
+      [],
+      ['Top 5 Ports (Nmap)','Unique Hosts'],
+      ...topPortsNmap.slice(0,5).map(r=> [r.Port, r.UniqueHosts]),
+    ];
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(chartsSheet), 'Charts');
+
+    const fname = `${(client||'Client').replace(/[^a-z0-9_-]/gi,'_')}_${(project||'Project').replace(/[^a-z0-9_-]/gi,'_')}_${(scanDate||todayStr())}.xlsx`;
+    XLSX.writeFile(wb, fname);
+  }
+
+  // Datasets for charts
+  const sevChartData = {
+    labels: ['Critical','High','Medium','Low'],
+    datasets: [{ label: 'Open Findings', data: [counts.Critical||0, counts.High||0, counts.Medium||0, counts.Low||0],
+      backgroundColor: ['Critical','High','Medium','Low'].map(s => SEV_COLORS[s]) }]
+  };
+  const top10Data = {
+    labels: top10.map(r=> r.Vulnerability),
+    datasets: [{ label: 'Unique Hosts', data: top10.map(r=> r.UniqueHosts), backgroundColor: top10.map(r=> SEV_COLORS[r.Severity]||'#475569') }]
+  };
+  const hostData = {
+    labels: hostBreakdown.map(r=> r.Host),
+    datasets: [{ label: 'Open Findings', data: hostBreakdown.map(r=> r.OpenFindings), backgroundColor: '#334155' }]
+  };
+  const portsNessusData = {
+    labels: topPortsNessus.map(r=> r.Port),
+    datasets: [{ label: 'Open Findings', data: topPortsNessus.map(r=> r.OpenFindings), backgroundColor: '#475569' }]
+  };
+  const portsNmapData = {
+    labels: topPortsNmap.map(r=> r.Port),
+    datasets: [{ label: 'Unique Hosts', data: topPortsNmap.map(r=> r.UniqueHosts), backgroundColor: '#0ea5e9' }]
+  };
+
+  return (
+    <div className="min-h-screen p-6">
+      <div className="max-w-7xl mx-auto space-y-6">
+        <header className="card p-4 flex flex-col md:flex-row md:items-end md:justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-bold">Web Vulnerability Management Dashboard</h1>
+            <p className="text-sm text-slate-500">Upload Nessus CSV + optional Nmap TXT → dashboards, tracker (with synopsis & recommendation), ports & services, and Excel export.</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <input className="px-3 py-2 rounded-xl border w-44" placeholder="Client name" value={client} onChange={e=>setClient(e.target.value)}/>
+            <select className="px-3 py-2 rounded-xl border" onChange={e=>loadForClient(e.target.value)}>
+              <option value="">Load saved client…</option>
+              {clients.map(c=> <option key={c} value={c}>{c}</option>)}
+            </select>
+            <button onClick={()=>{
+              if (!client) return alert('Enter client name');
+              const snap = { client, project, scanDate: scanDate || todayStr(), trackerMain, trackerInfo };
+              saveClientSnapshot(snap); setClients(listClients()); alert('Saved for client: ' + client);
+            }} className="px-3 py-2 rounded-xl border bg-white hover:bg-slate-100">Save Client</button>
+            <button onClick={()=>{
+              if (!client) return alert('Select client');
+              localStorage.removeItem(LS_PREFIX + client); setClients(listClients());
+              setProject(''); setScanDate(''); setTrackerMain([]); setTrackerInfo([]); setRaw([]); setNmapRows([]);
+            }} className="px-3 py-2 rounded-xl border bg-white hover:bg-slate-100">Clear Client</button>
+
+            <input className="px-3 py-2 rounded-xl border w-44" placeholder="Project name" value={project} onChange={e=>setProject(e.target.value)}/>
+            <input className="px-3 py-2 rounded-xl border" type="date" value={scanDate} onChange={e=>setScanDate(e.target.value)}/>
+            <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-900 text-white cursor-pointer">
+              <span>Upload Nessus CSV</span>
+              <input type="file" accept=".csv" className="hidden" onChange={e=> e.target.files && handleCSV(e.target.files[0])}/>
+            </label>
+            <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-sky-600 text-white cursor-pointer">
+              <span>Upload Nmap TXT</span>
+              <input type="file" accept=".txt,.log" className="hidden" onChange={e=> e.target.files && handleNmap(e.target.files[0])}/>
+            </label>
+            <button onClick={downloadExcel} disabled={!raw.length && !nmapRows.length} className="px-3 py-2 rounded-xl border bg-white hover:bg-slate-100">Download Excel</button>
+          </div>
+        </header>
+
+        <nav className="flex gap-2">
+          {['dashboard','tracker','info','all','ports'].map(k=> (
+            <button key={k} onClick={()=>setTab(k)} className={`px-4 py-2 rounded-xl border ${tab===k?'bg-slate-900 text-white':'bg-white hover:bg-slate-100'}`}>
+              {k==='dashboard'?'Dashboard':k==='tracker'?'Tracker':k==='info'?'Info':k==='ports'?'Ports & Services':'All Findings'}
+            </button>
+          ))}
+        </nav>
+
+        {tab==='dashboard' && (
+          <section className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+            <div className="card p-4">
+              <div className="flex items-center justify-between">
+                <h2 className="font-semibold">Severity Summary (Open Only)</h2>
+                <span className="text-xs text-slate-500">{project||'—'} · {scanDate||'—'}</span>
+              </div>
+              <table className="w-full mt-3 text-sm">
+                <thead><tr className="text-left"><th className="py-1">Severity</th><th className="py-1">Open Count</th></tr></thead>
+                <tbody>
+                  {['Critical','High','Medium','Low'].map(sev => (
+                    <tr key={sev}>
+                      <td className="py-1"><span className="pill" style={{background: SEV_COLORS[sev]}}>{sev}</span></td>
+                      <td className="py-1 font-semibold">{counts[sev]||0}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="card p-4">
+              <h2 className="font-semibold mb-2">Open Findings by Severity</h2>
+              <ChartBox type="pie" data={sevChartData} options={{ plugins:{legend:{position:'bottom'}}, maintainAspectRatio:false }} />
+            </div>
+
+            <div className="card p-4">
+              <h2 className="font-semibold mb-2">Open Findings by Severity</h2>
+              <ChartBox type="bar" data={sevChartData} options={{ plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}}, maintainAspectRatio:false }} />
+            </div>
+
+            <div className="card p-4 xl:col-span-2">
+              <h2 className="font-semibold mb-2">Top 10 Vulnerabilities (by Unique Hosts, Open)</h2>
+              <ChartBox type="bar" data={top10Data} options={{ plugins:{legend:{display:false}, tooltip:{enabled:true}}, scales:{y:{beginAtZero:true}}, maintainAspectRatio:false }} className="chart-wrap-tall"/>
+              <div className="table-scroller mt-3 text-sm">
+                <table className="w-full">
+                  <thead><tr className="text-left"><th className="py-1">Vulnerability</th><th className="py-1">Severity</th><th className="py-1">Unique Hosts</th></tr></thead>
+                  <tbody>{top10.map((r,i)=>(
+                    <tr key={i}><td className="py-1">{r.Vulnerability}</td><td className="py-1"><span className="pill" style={{background:SEV_COLORS[r.Severity]}}>{r.Severity}</span></td><td className="py-1 font-semibold">{r.UniqueHosts}</td></tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="card p-4">
+              <h2 className="font-semibold mb-2">Host Breakdown (Open Findings)</h2>
+              <ChartBox type="bar" data={hostData} options={{ plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}}, maintainAspectRatio:false }} className="chart-wrap-tall"/>
+              <div className="table-scroller mt-3 text-sm">
+                <table className="w-full">
+                  <thead><tr className="text-left"><th className="py-1">Host</th><th className="py-1">Open Findings</th></tr></thead>
+                  <tbody>{hostBreakdown.map((r,i)=>(
+                    <tr key={i}><td className="py-1 monosmall">{r.Host}</td><td className="py-1 font-semibold">{r.OpenFindings}</td></tr>
+                  ))}</tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="card p-4">
+              <div className="flex items-center justify-between">
+                <h2 className="font-semibold">Unique Hosts (Open Findings)</h2>
+                <span className="text-xs text-slate-500">{project||'—'} · {scanDate||'—'}</span>
+              </div>
+              <div className="mt-3 grid grid-cols-2 lg:grid-cols-5 gap-3">
+                <div className="p-3 rounded-xl bg-slate-50">
+                  <div className="text-xs text-slate-500">Total</div>
+                  <div className="text-2xl font-bold">{totalUniqueOpenHosts}</div>
+                </div>
+                {['Critical','High','Medium','Low'].map(sev=>(
+                  <div key={sev} className="p-3 rounded-xl bg-slate-50">
+                    <div className="text-xs text-slate-500 flex items-center gap-2">
+                      <span className="pill" style={{background: SEV_COLORS[sev]}}>{sev}</span>
+                    </div>
+                    <div className="text-2xl font-bold">{openHostCountsBySev[sev]||0}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {tab==='tracker' && (
+          <section className="card p-4">
+            <h2 className="font-semibold mb-3">Tracker (Critical/High/Medium/Low)</h2>
+            <div className="table-scroller">
+            <table className="w-full text-sm">
+              <thead><tr className="text-left align-top">
+                <th className="py-1">Risk Factor</th>
+                <th className="py-1">Name</th>
+                <th className="py-1">Synopsis</th>
+                <th className="py-1">Recommendation</th>
+                <th className="py-1">Hosts</th>
+                <th className="py-1">Status</th>
+                <th className="py-1">Owner</th>
+                <th className="py-1">Target Date</th>
+                <th className="py-1">Aging (days)</th>
+              </tr></thead>
+              <tbody>
+                {trackerMain.map((r,idx)=>{
+                  const days = r.targetDate? Math.floor((Date.now()-new Date(r.targetDate).getTime())/(1000*60*60*24)) : '';
+                  return (<tr key={idx} className="align-top">
+                    <td className="py-1"><span className="pill" style={{background:SEV_COLORS[r.severity]}}>{r.severity}</span></td>
+                    <td className="py-1 min-w-[16rem]">{r.name}</td>
+                    <td className="py-1 min-w-[18rem] whitespace-pre-wrap">{r.synopsis || '—'}</td>
+                    <td className="py-1 min-w-[18rem] whitespace-pre-wrap">{r.recommendation || '—'}</td>
+                    <td className="py-1 min-w-[16rem] whitespace-pre-wrap">{(r.hosts||[]).join(', ')}</td>
+                    <td className="py-1">
+                      <select value={r.status} onChange={e=>updateTracker('main', idx, { status:e.target.value })} className="px-2 py-1 rounded border">
+                        <option>Open</option><option>Closed</option>
+                      </select>
+                    </td>
+                    <td className="py-1"><input value={r.owner||''} onChange={e=>updateTracker('main', idx, { owner:e.target.value })} className="px-2 py-1 rounded border w-40" placeholder="owner"/></td>
+                    <td className="py-1"><input type="date" value={r.targetDate||''} onChange={e=>updateTracker('main', idx, { targetDate:e.target.value })} className="px-2 py-1 rounded border"/></td>
+                    <td className={"py-1 font-semibold " + (typeof days==='number' ? (days>0? 'text-red-600' : days===0? 'text-orange-500' : 'text-green-600') : '')}>{days}</td>
+                  </tr>);
+                })}
+              </tbody>
+            </table>
+            </div>
+          </section>
+        )}
+
+        {tab==='info' && (
+          <section className="card p-4">
+            <h2 className="font-semibold mb-3">Info-level Findings</h2>
+            <div className="table-scroller">
+            <table className="w-full text-sm">
+              <thead><tr className="text-left align-top">
+                <th className="py-1">Risk Factor</th>
+                <th className="py-1">Name</th>
+                <th className="py-1">Synopsis</th>
+                <th className="py-1">Recommendation</th>
+                <th className="py-1">Hosts</th>
+                <th className="py-1">Status</th>
+                <th className="py-1">Owner</th>
+                <th className="py-1">Target Date</th>
+                <th className="py-1">Aging (days)</th>
+              </tr></thead>
+              <tbody>
+                {trackerInfo.map((r,idx)=>{
+                  const days = r.targetDate? Math.floor((Date.now()-new Date(r.targetDate).getTime())/(1000*60*60*24)) : '';
+                  return (<tr key={idx} className="align-top">
+                    <td className="py-1"><span className="pill" style={{background:SEV_COLORS['Info']}}>Info</span></td>
+                    <td className="py-1 min-w-[16rem]">{r.name}</td>
+                    <td className="py-1 min-w-[18rem] whitespace-pre-wrap">{r.synopsis || '—'}</td>
+                    <td className="py-1 min-w-[18rem] whitespace-pre-wrap">{r.recommendation || '—'}</td>
+                    <td className="py-1 min-w-[16rem] whitespace-pre-wrap">{(r.hosts||[]).join(', ')}</td>
+                    <td className="py-1">
+                      <select value={r.status} onChange={e=>updateTracker('info', idx, { status:e.target.value })} className="px-2 py-1 rounded border">
+                        <option>Open</option><option>Closed</option>
+                      </select>
+                    </td>
+                    <td className="py-1"><input value={r.owner||''} onChange={e=>updateTracker('info', idx, { owner:e.target.value })} className="px-2 py-1 rounded border w-40" placeholder="owner"/></td>
+                    <td className="py-1"><input type="date" value={r.targetDate||''} onChange={e=>updateTracker('info', idx, { targetDate:e.target.value })} className="px-2 py-1 rounded border"/></td>
+                    <td className="py-1 font-semibold">{days}</td>
+                  </tr>);
+                })}
+              </tbody>
+            </table>
+            </div>
+          </section>
+        )}
+
+        {tab==='all' && (
+          <section className="card p-4">
+            <h2 className="font-semibold mb-3">All Findings (Critical → High → Medium → Low)</h2>
+
+            <div className="flex flex-wrap items-center gap-3 mb-3">
+              <label className="text-sm text-slate-600">Sort by</label>
+              <select
+                className="px-2 py-1 rounded border"
+                value={allSortBy}
+                onChange={e=>setAllSortBy(e.target.value)}
+              >
+                <option value="severity">Severity (Critical→Low)</option>
+                <option value="name">Name (A→Z)</option>
+                <option value="host">Host (A→Z, first host)</option>
+                <option value="port">Port (numeric)</option>
+                <option value="service">Service (A→Z)</option>
+              </select>
+
+              <select
+                className="px-2 py-1 rounded border"
+                value={allSortDir}
+                onChange={e=>setAllSortDir(e.target.value)}
+              >
+                <option value="asc">Ascending</option>
+                <option value="desc">Descending</option>
+              </select>
+            </div>
+
+            <div className="table-scroller">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr>
+                    {allFindingsSorted[0] && Object.keys(allFindingsSorted[0]).map((h,i)=>(
+                      <th key={i} className="text-left py-1 px-1 whitespace-nowrap">
+                        {h}
+                        {(allSortBy==='name' && h==='Name') ||
+                         (allSortBy==='severity' && h==='Risk Factor') ||
+                         (allSortBy==='host' && h==='Host') ||
+                         (allSortBy==='port' && h==='Port') ||
+                         (allSortBy==='service' && h==='Service')
+                          ? <span className="ml-1 text-xs text-slate-500">({allSortDir})</span>
+                          : null}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {allFindingsSorted.map((r,idx)=>(
+                    <tr key={idx}>
+                      {Object.keys(allFindingsSorted[0]||{}).map((h,i)=> (
+                        <td key={i} className={"py-1 px-1 " + (h==='Risk Factor'?'text-white font-semibold':'')} style={h==='Risk Factor'? {background: SEV_COLORS[r['Risk Factor']||'Info']} : {}}>
+                          {String(r[h]??'')}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {tab==='ports' && (
+          <section className="space-y-6">
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+              <div className="card p-4">
+                <h2 className="font-semibold mb-2">
+                  Top Ports (Nessus Open Findings)
+                  <span className="ml-2 text-xs text-slate-500">· {totalUniqueOpenHosts} unique hosts (open)</span>
+                </h2>
+                <ChartBox type="bar" data={portsNessusData} options={{ plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}}, maintainAspectRatio:false }} className="chart-wrap-tall"/>
+              </div>
+              <div className="card p-4">
+                <h2 className="font-semibold mb-2">
+                  Top Ports (Nmap Unique Hosts)
+                  <span className="ml-2 text-xs text-slate-500">· {nmapUniqueHostCount || 0} unique hosts</span>
+                </h2>
+                <ChartBox type="bar" data={portsNmapData} options={{ plugins:{legend:{display:false}}, scales:{y:{beginAtZero:true}}, maintainAspectRatio:false }} className="chart-wrap-tall"/>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+              <div className="card p-4">
+                <h2 className="font-semibold mb-2">Ports & Services — Nessus (Open Only)</h2>
+                <div className="table-scroller">
+                  <table className="w-full text-sm">
+                    <thead><tr className="text-left">
+                      <th className="py-1">Port</th><th className="py-1">Service</th><th className="py-1">Protocol</th>
+                      <th className="py-1">Open Findings</th><th className="py-1">Unique Hosts</th><th className="py-1">Hosts</th>
+                    </tr></thead>
+                    <tbody>
+                      {psNessus.map((g,i)=>(
+                        <tr key={i}><td className="py-1">{g.port||'—'}</td><td className="py-1">{g.service||'—'}</td><td className="py-1">{g.protocol||'—'}</td><td className="py-1 font-semibold">{g.count}</td><td className="py-1">{g.hosts.length}</td><td className="py-1 whitespace-pre-wrap">{g.hosts.join(', ')}</td></tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              <div className="card p-4">
+                <h2 className="font-semibold mb-2">Ports & Services — Nmap</h2>
+                <div className="table-scroller">
+                  <table className="w-full text-sm">
+                    <thead><tr className="text-left">
+                      <th className="py-1">Port</th><th className="py-1">Service</th><th className="py-1">Protocol</th>
+                      <th className="py-1">Rows</th><th className="py-1">Unique Hosts</th><th className="py-1">Hosts</th>
+                    </tr></thead>
+                    <tbody>
+                      {psNmap.map((g,i)=>(
+                        <tr key={i}><td className="py-1">{g.port||'—'}</td><td className="py-1">{g.service||'—'}</td><td className="py-1">{g.protocol||'—'}</td><td className="py-1">{g.count}</td><td className="py-1 font-semibold">{g.hosts.length}</td><td className="py-1 whitespace-pre-wrap">{g.hosts.join(', ')}</td></tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+              <div className="card p-4">
+                <h2 className="font-semibold mb-2">Unique IPs per Port — Nessus (Open Only)</h2>
+                <div className="table-scroller">
+                  {(() => {
+                    const m = new Map();
+                    psNessus.forEach(g=>{
+                      const port = g.port||'(none)';
+                      if(!m.has(port)) m.set(port, new Set());
+                      g.hosts.forEach(h=> m.get(port).add(h));
+                    });
+                    const rows = Array.from(m.entries()).map(([Port,set])=>({Port, UniqueHosts:set.size})).sort((a,b)=> b.UniqueHosts-a.UniqueHosts || (''+a.Port).localeCompare(''+b.Port));
+                    return (
+                      <table className="w-full text-sm">
+                        <thead><tr className="text-left"><th className="py-1">Port</th><th className="py-1">Unique Hosts</th></tr></thead>
+                        <tbody>{rows.map((r,i)=>(<tr key={i}><td className="py-1">{r.Port}</td><td className="py-1 font-semibold">{r.UniqueHosts}</td></tr>))}</tbody>
+                      </table>
+                    );
+                  })()}
+                </div>
+              </div>
+
+              <div className="card p-4">
+                <h2 className="font-semibold mb-2">Unique IPs per Port — Nmap</h2>
+                <div className="table-scroller">
+                  {(() => {
+                    const rows = uniqueIPsPerPort(nmapRows);
+                    return (
+                      <table className="w-full text-sm">
+                        <thead><tr className="text-left"><th className="py-1">Port</th><th className="py-1">Unique Hosts</th></tr></thead>
+                        <tbody>{rows.map((r,i)=>(<tr key={i}><td className="py-1">{r.Port}</td><td className="py-1 font-semibold">{r.UniqueHosts}</td></tr>))}</tbody>
+                      </table>
+                    );
+                  })()}
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
